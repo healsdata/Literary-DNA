@@ -23,6 +23,8 @@ literary-dna ingest embed   # Embed selected passages via Bedrock
 literary-dna ingest load    # Upsert embeddings into the vector store
 ```
 
+All stages accept `--author <id>` to operate on a single author, which is useful during development when iterating on a specific author without re-running the full corpus.
+
 Run stages individually or chain them. Each stage reads from and writes to well-defined files so any stage can be re-run independently.
 
 ---
@@ -33,7 +35,7 @@ Run stages individually or chain them. Each stage reads from and writes to well-
 authors.yaml
     │
     ▼
-[fetch] ──► corpus/raw/<author-id>.txt (one file per author)
+[fetch] ──► corpus/raw/<author-id>/<gutenberg-id>.txt (one file per book)
     │
     ▼
 [chunk] ──► corpus/candidates.json (scored, selected passages)
@@ -73,36 +75,46 @@ The curation of which authors to include and which Gutenberg texts to use is an 
 
 ## Stage 1: `fetch`
 
-Reads `authors.yaml`, calls the Gutendex API (`gutendex.com/books/<id>`) to resolve download URLs, and saves raw `.txt` files to `corpus/raw/`.
+Reads `authors.yaml`, calls the Gutendex API (`gutendex.com/books/<id>`) to resolve download URLs, and saves raw `.txt` files to `corpus/raw/<author-id>/<gutenberg-id>.txt` — one file per book, preserving provenance.
 
-**Idempotency:** Skips authors whose file already exists. Use `--force` to re-fetch.
+**Rate limiting:** Requests to the Gutendex API are limited to 1 per second to be a good citizen of a free community service.
 
-**Output:** `corpus/raw/<author-id>.txt` — concatenated raw text from all listed Gutenberg IDs for that author, separated by a marker line.
+**Idempotency:** Skips files that already exist. Use `--force` to re-fetch.
+
+**Output:** `corpus/raw/<author-id>/<gutenberg-id>.txt` — raw Gutenberg text for a single book.
 
 ---
 
 ## Stage 2: `chunk`
 
-Splits each raw text into passage candidates, scores them for prose quality, and selects the top N per author.
+Reads each raw text file, splits it into passage candidates, scores them for prose quality, and selects the top N per author.
+
+### Token counting
+
+All token counts use whitespace-delimited word count. This is simpler than BPE tokenization and sufficient for the purpose of bounding chunk sizes.
 
 ### Splitting
 
-Passages are split at double-newline paragraph boundaries. Chunks outside 200–700 tokens are dropped outright. Chunks over the maximum are split at sentence boundaries with 10% token overlap.
+Passages are split at double-newline paragraph boundaries. Chunks outside 200–700 words are dropped outright. Chunks over the maximum are split at sentence boundaries with a 10% word-count overlap.
 
 ### Scoring
 
-Each candidate is scored 0.0–1.0. Penalties are applied for:
+Each candidate starts at a score of 1.0. Penalties are applied for signals that indicate non-prose or low-quality content:
 
 | Signal | Penalty |
 |--------|---------|
-| High dialogue ratio (>30% of lines starting with `"` or `—`) | −0.3 |
-| Short average sentence length (<8 words) | −0.2 |
 | Gutenberg boilerplate markers (`Project Gutenberg`, `CHAPTER`, standalone roman numerals) | discard |
-| Very low lexical diversity (type/token ratio <0.4) | −0.15 |
+| Short average sentence length (<8 words) | −0.2 |
+| Dialogue ratio 30–60% (lines starting with `"` or `—`) | −0.15 |
+| Dialogue ratio >60% | −0.3 |
+
+The TTR (type-token ratio) signal has been excluded. TTR is length-dependent — longer passages mechanically score lower because common words repeat — which would bias selection toward shorter chunks regardless of quality.
+
+The scoring is a "reject bad" filter, not a ranking of quality among good passages. Any passage that survives all discard checks with a score above 0.5 is considered a viable candidate; the top `target_passages` by score are selected.
 
 ### Selection
 
-After scoring, the top `target_passages` candidates per author are selected. The rest are discarded.
+After scoring, the top `target_passages` candidates per author are selected across all that author's books combined. The rest are discarded.
 
 **Dry run:** Pass `--dry-run` to print selected passages to stdout without writing `candidates.json`. Use this to eyeball the selection before committing to embed.
 
@@ -115,7 +127,8 @@ After scoring, the top `target_passages` candidates per author are selected. The
   "author_name": "Ernest Hemingway",
   "text": "...",
   "score": 0.87,
-  "source_file": "corpus/raw/hemingway.txt",
+  "source_file": "corpus/raw/hemingway/67138.txt",
+  "gutenberg_id": 67138,
   "char_offset": 14823
 }
 ```
@@ -124,19 +137,23 @@ After scoring, the top `target_passages` candidates per author are selected. The
 
 ## Stage 3: `embed`
 
-Reads `corpus/candidates.json` and sends each passage to the Amazon Bedrock Titan Embeddings V2 model. Writes the resulting vectors alongside passage metadata.
+Reads `corpus/candidates.json` and sends each passage to the Amazon Bedrock Titan Embeddings V2 model.
+
+**Model:** `amazon.titan-embed-text-v2:0`  
+**Vector dimension:** 1024 (default; do not use the reduced 256/512 variants — full dimension gives the best similarity signal)  
+**AWS region:** configured via `AWS_REGION` environment variable
 
 **Idempotency:** Tracks embedded passage IDs in `corpus/embedded.json`. Skips passages already present on re-run.
 
 **Error handling:** Bedrock API errors are retried with exponential backoff (3 attempts, starting at 500ms). Unrecoverable failures log the passage ID and continue. A summary of failed passages is printed at the end.
 
-**Output:** `corpus/embedded.json` — same shape as `candidates.json` with an added `"vector": [float32, ...]` field per passage.
+**Output:** `corpus/embedded.json` — same shape as `candidates.json` with an added `"vector": [float32 × 1024]` field per passage.
 
 ---
 
 ## Stage 4: `load`
 
-Reads `corpus/embedded.json` and upserts all passages into the configured vector store. Idempotent on passage ID — safe to run multiple times.
+Reads `corpus/embedded.json` and loads all passages into the configured vector store. When re-loading an author (e.g. after re-curation), the stage deletes all existing passages for that author before inserting the new set, so stale passages do not accumulate.
 
 ### Store Interface
 
@@ -145,6 +162,7 @@ Both backends implement a common Go interface:
 ```go
 type Store interface {
     Upsert(ctx context.Context, passages []Passage) error
+    DeleteByAuthor(ctx context.Context, authorID string) error
     Search(ctx context.Context, vec []float32, topK int) ([]Match, error)
     Close() error
 }
@@ -159,6 +177,8 @@ Backend is selected via the `STORE_BACKEND` environment variable or `--store` fl
 
 Connection strings are provided via environment variables (`CHROMA_URL`, `DATABASE_URL`).
 
+`load` uses `DeleteByAuthor` + `Upsert` rather than pure upsert, so it is safe to re-run after changing which passages are selected for an author.
+
 ---
 
 ## Idempotency Summary
@@ -168,7 +188,7 @@ Connection strings are provided via environment variables (`CHROMA_URL`, `DATABA
 | `fetch` | Skips if output file exists; `--force` to override |
 | `chunk` | Deterministic — same input always produces same output |
 | `embed` | Skips passage IDs already in `embedded.json` |
-| `load` | Upsert by passage ID |
+| `load` | DeleteByAuthor + insert per author |
 
 ---
 
@@ -182,7 +202,7 @@ Connection strings are provided via environment variables (`CHROMA_URL`, `DATABA
 
 ## Testing
 
-**Unit tests** cover the chunking and scoring logic. `testdata/` contains fixture `.txt` files with known-good prose passages and known-bad content (dialogue-heavy, boilerplate) to verify scoring behaviour.
+**Unit tests** cover the chunking and scoring logic. `testdata/` contains fixture `.txt` files with known-good prose passages and known-bad content (dialogue-heavy, boilerplate) to verify scoring behaviour, including edge cases around chunk overlap boundaries.
 
 **Integration tests** exercise each `Store` implementation:
 - `ChromaStore` — runs against a local ChromaDB instance in CI
