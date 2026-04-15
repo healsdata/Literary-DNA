@@ -30,6 +30,7 @@ Accept: text/event-stream
 **Validation:**
 - `text` must be present and non-empty
 - Minimum 20 whitespace-delimited words
+- Maximum 5,000 whitespace-delimited words (stays within Titan Embeddings V2's 8,192 token limit with headroom)
 - Returns `400 Bad Request` with `{"error": "..."}` if validation fails
 
 **Failure responses:**
@@ -161,7 +162,17 @@ type Store interface {
     Search(ctx context.Context, vec []float32, topK int) ([]Match, error)
     Close() error
 }
+
+type Match struct {
+    PassageID  string
+    AuthorID   string
+    AuthorName string  // stored as metadata in the vector store at ingest time
+    Text       string
+    Score      float32
+}
 ```
+
+`AuthorName` is stored as metadata alongside each passage in the vector store at ingestion time. The API server does not perform a separate lookup against `authors.yaml`.
 
 ---
 
@@ -196,8 +207,27 @@ All configuration via environment variables:
 
 - Standard library only (`net/http`) — no external router dependency
 - SSE flushing: handler checks that `ResponseWriter` implements `http.Flusher` and calls `Flush()` after each event
-- CORS headers set on all responses to support browser-based frontend
-- Request context cancellation propagated to Bedrock calls so abandoned requests don't waste API quota
+- Request context cancellation propagated to Bedrock calls so abandoned requests don't waste API quota; the 30s timeout applies specifically to the Claude Converse call via `context.WithTimeout(r.Context(), 30*time.Second)`, not to the entire request handler
+- Always use `json.Marshal` for SSE `data:` payloads — never string interpolation; passage text contains embedded newlines that must be JSON-escaped
+
+### CORS
+
+The browser sends an OPTIONS preflight before the POST because the request uses `Content-Type: application/json`. Both the preflight and the actual response need explicit headers.
+
+**OPTIONS preflight response:**
+```
+Access-Control-Allow-Origin: <CORS_ORIGIN>
+Access-Control-Allow-Methods: POST, OPTIONS
+Access-Control-Allow-Headers: Content-Type
+Access-Control-Max-Age: 86400
+```
+
+**POST response (including SSE stream):**
+```
+Access-Control-Allow-Origin: <CORS_ORIGIN>
+```
+
+The `/analyze` handler checks the request method and responds to OPTIONS before any other processing.
 
 ---
 
@@ -215,6 +245,16 @@ All configuration via environment variables:
 **Not tested in CI:**
 - Real Bedrock calls (requires AWS credentials and incurs cost)
 - Real vector store (covered by ingestion pipeline integration tests)
+
+---
+
+## Additional Endpoints
+
+```
+GET /health
+```
+
+Returns `200 OK` with `{"status": "ok"}`. Used for load balancer and container health checks. No dependencies checked — if the process is running, it's healthy.
 
 ---
 
