@@ -6,7 +6,7 @@
 
 **Architecture:** Single Go binary with a `cmd/ingest/` package for subcommand wiring and `internal/` packages for pipeline logic, corpus types, store backends, and the Bedrock client. File-backed intermediate state between stages (candidates.json, embedded.json). Store backend is swappable via `STORE_BACKEND` env var.
 
-**Tech Stack:** Go 1.22, Cobra CLI, gopkg.in/yaml.v3, AWS SDK for Go v2 (Bedrock), amikos-tech/chroma-go, jackc/pgx v5, pgvector/pgvector-go
+**Tech Stack:** Go 1.22, Cobra CLI, gopkg.in/yaml.v3, AWS SDK for Go v2 (Bedrock), jackc/pgx v5, pgvector/pgvector-go (ChromaDB via HTTP REST — no client library)
 
 ---
 
@@ -85,7 +85,6 @@ go get gopkg.in/yaml.v3@v3.0.1
 go get github.com/aws/aws-sdk-go-v2@v1.30.0
 go get github.com/aws/aws-sdk-go-v2/config@v1.27.0
 go get github.com/aws/aws-sdk-go-v2/service/bedrockruntime@v1.13.0
-go get github.com/amikos-tech/chroma-go@v0.1.4
 go get github.com/jackc/pgx/v5@v5.6.0
 go get github.com/pgvector/pgvector-go@v0.2.1
 ```
@@ -94,14 +93,17 @@ Expected: `go.sum` populated, `go.mod` updated with `require` block.
 
 - [ ] **Step 3: Create `cmd/root.go`**
 
+`SilenceErrors = true` prevents Cobra from printing errors itself — `main.go` handles that. Without it, errors print twice.
+
 ```go
 package cmd
 
 import "github.com/spf13/cobra"
 
 var rootCmd = &cobra.Command{
-    Use:   "literary-dna",
-    Short: "Find your literary doppelgangers",
+    Use:          "literary-dna",
+    Short:        "Find your literary doppelgangers",
+    SilenceErrors: true,
 }
 
 func Root() *cobra.Command { return rootCmd }
@@ -181,6 +183,8 @@ git commit -m "feat: scaffold literary-dna binary with ingest subcommand group"
 
 - [ ] **Step 1: Create `testdata/authors-test.yaml`**
 
+The third author has no `target_passages` field — this exercises the default-value logic.
+
 ```yaml
 authors:
   - id: hemingway
@@ -191,6 +195,10 @@ authors:
     name: Jane Austen
     gutenberg_ids: [1342]
     target_passages: 5
+  - id: verne
+    name: Jules Verne
+    gutenberg_ids: [164]
+    # no target_passages — should default to 25
 ```
 
 - [ ] **Step 2: Write the failing test**
@@ -210,8 +218,8 @@ func TestLoadConfig(t *testing.T) {
     if err != nil {
         t.Fatalf("LoadConfig: %v", err)
     }
-    if len(cfg.Authors) != 2 {
-        t.Fatalf("want 2 authors, got %d", len(cfg.Authors))
+    if len(cfg.Authors) != 3 {
+        t.Fatalf("want 3 authors, got %d", len(cfg.Authors))
     }
     a := cfg.Authors[0]
     if a.ID != "hemingway" {
@@ -233,11 +241,14 @@ func TestLoadConfig_DefaultTargetPassages(t *testing.T) {
     if err != nil {
         t.Fatalf("LoadConfig: %v", err)
     }
-    // Both test authors have explicit target_passages, so just verify non-zero
-    for _, a := range cfg.Authors {
-        if a.TargetPassages <= 0 {
-            t.Errorf("author %q has non-positive target_passages: %d", a.ID, a.TargetPassages)
-        }
+    // verne has no target_passages in YAML — must receive the default of 25
+    verne := cfg.Authors[2]
+    if verne.ID != "verne" {
+        t.Fatalf("want third author to be verne, got %q", verne.ID)
+    }
+    if verne.TargetPassages != config.DefaultTargetPassages {
+        t.Errorf("want default target_passages=%d, got %d",
+            config.DefaultTargetPassages, verne.TargetPassages)
     }
 }
 
@@ -358,7 +369,7 @@ type Match struct {
     AuthorID   string
     AuthorName string
     Text       string
-    Score      float32
+    Score      float64
 }
 ```
 
@@ -482,6 +493,16 @@ func TestEmbeddedIDSet(t *testing.T) {
         t.Errorf("missing expected IDs in set: %v", ids)
     }
 }
+
+func TestReadEmbeddedIDs_MissingFile(t *testing.T) {
+    ids, err := corpus.ReadEmbeddedIDs("nonexistent/embedded.json")
+    if err != nil {
+        t.Fatalf("want nil error for missing file, got: %v", err)
+    }
+    if len(ids) != 0 {
+        t.Errorf("want empty ID set for missing file, got: %v", ids)
+    }
+}
 ```
 
 - [ ] **Step 4: Run tests to verify they fail**
@@ -531,6 +552,7 @@ package corpus
 
 import (
     "encoding/json"
+    "errors"
     "fmt"
     "os"
 )
@@ -560,7 +582,7 @@ func ReadEmbedded(path string) ([]EmbeddedPassage, error) {
 func ReadEmbeddedIDs(path string) (map[string]bool, error) {
     ids := make(map[string]bool)
     passages, err := ReadEmbedded(path)
-    if os.IsNotExist(err) {
+    if errors.Is(err, os.ErrNotExist) {
         return ids, nil
     }
     if err != nil {
@@ -649,14 +671,10 @@ git commit -m "feat: define Store interface"
 
 - [ ] **Step 1: Create test fixtures**
 
-`testdata/fixtures/prose-good.txt` — 300 words of clean narrative prose:
+`testdata/fixtures/prose-good.txt` — a single paragraph of 300+ words (must exceed the 200-word minimum so `SplitParagraphs` keeps it as one chunk):
 
 ```
-The old man had been watching the sea for forty years, long enough to know its moods the way a musician knows a difficult score. Every morning he walked down to the dock before the fishing boats went out, not to fish himself but to read the water. The colour of it, the pattern of the swells, the way the light moved on the surface — these things told him what the day would bring. He had learned this from his father and his father's father before him, men who had lived and died within sight of the same horizon.
-
-On the morning in question the sea was the colour of old pewter, flat and still under a sky that promised nothing. The village behind him was just waking. He could hear the baker beginning his work, the sound of a shutter being pushed open, a dog somewhere in the lanes above the harbour. He did not turn around. Whatever happened behind him felt like a different world entirely, one that he had only a provisional relationship with. His real life had always been here, at the edge of things, where the land ran out of certainty.
-
-He was thinking about his son, who had left for the city the previous autumn and had not written. This was not unusual. His son had always been better at leaving than at keeping in touch, better at new beginnings than at the maintenance of old attachments. The old man did not blame him for this. He understood it as something that had been in the family a long time, a restlessness that skipped generations the way certain physical traits did.
+The old man had been watching the sea for forty years, long enough to know its moods the way a musician knows a difficult score — not by rule or theory but by something that had accumulated in him without his noticing, the way silt accumulates at the mouth of a river. Every morning he walked down to the dock before the fishing boats went out, not to fish himself but to read the water. The colour of it, the pattern of the swells, the way the light moved on the surface in the hour before full sunrise — these things told him what the day would bring, and he had never known them to lie. He had learned this from his father and his father's father before him, men who had lived and died within sight of the same horizon, who had never felt the need to explain what they were doing when they stood at the water's edge in silence, because the silence was the explanation, or it was close enough to one. On the morning in question the sea was the colour of old pewter, flat and still under a sky that promised nothing in either direction. The village behind him was just waking. He could hear the baker beginning his work, the sound of a shutter being pushed open on a high window, a dog somewhere in the lanes above the harbour giving a single bark and then going quiet. He did not turn around. Whatever happened behind him felt like a different world entirely, one that he had only a provisional relationship with, the way a man on a long journey has a provisional relationship with the towns he passes through — present in them for a moment, never really of them. His real life had always been here, at the edge of things, where the land ran out of certainty.
 ```
 
 - [ ] **Step 2: Write failing tests for splitting**
@@ -819,8 +837,13 @@ func splitWithOverlap(text string) []string {
             chunks = append(chunks, chunk)
         }
 
-        // Next chunk starts with overlap
-        overlapStart := end - overlapWords
+        // Calculate the true end position by counting words in the (possibly
+        // trimmed) chunk. Using the original `end` here would create a gap:
+        // words between the sentence boundary and `end` would be skipped.
+        actualEnd := start + len(strings.Fields(chunk))
+
+        // Next chunk starts with overlap from the actual end
+        overlapStart := actualEnd - overlapWords
         if overlapStart <= start {
             overlapStart = start + 1
         }
@@ -1004,14 +1027,9 @@ Expected: FAIL — `ScorePassage` undefined.
 
 - [ ] **Step 5: Add scoring functions to `internal/pipeline/chunk.go`**
 
-Add to the end of `chunk.go`:
+Add the following to the end of `chunk.go`. Then merge the new imports (`"regexp"`) into the existing import block at the top of the file — do not create a second `import` block; Go does not allow duplicate import declarations in the same file.
 
 ```go
-import (
-    "regexp"
-    "strings"
-)
-
 var boilerplatePatterns = []*regexp.Regexp{
     regexp.MustCompile(`(?i)project gutenberg`),
     regexp.MustCompile(`(?im)^\s*chapter\s+`),
@@ -1143,24 +1161,19 @@ Expected: FAIL — `ScoredChunk` and `SelectTop` undefined.
 
 - [ ] **Step 3: Add selection types and functions to `internal/pipeline/chunk.go`**
 
-Add to `chunk.go`:
+Add the following to `chunk.go`. Merge the new imports (`"fmt"`, `"os"`, `"sort"`, and the two `literary-dna/internal/...` paths) into the existing import block at the top of the file. Do not add a second `import` block.
 
 ```go
-import (
-    "fmt"
-    "os"
-    "sort"
-
-    "literary-dna/internal/config"
-    "literary-dna/internal/corpus"
-)
-
-// ScoredChunk is a passage candidate with its quality score.
+// ScoredChunk is a passage candidate with its quality score and provenance.
+// Source fields are set during ProcessAuthor so SelectTop doesn't need to
+// search back through a separate sourceMap.
 type ScoredChunk struct {
-    Text       string
-    Score      float64
-    Discard    bool
-    CharOffset int
+    Text        string
+    Score       float64
+    Discard     bool
+    CharOffset  int
+    SourceFile  string
+    GutenbergID int
 }
 
 // SelectTop filters out discarded and below-threshold chunks, then returns
@@ -1187,7 +1200,6 @@ func SelectTop(chunks []ScoredChunk, n int) []ScoredChunk {
 // objects ready to write to candidates.json.
 func ProcessAuthor(author config.Author, corpusDir string) ([]corpus.Passage, error) {
     var allChunks []ScoredChunk
-    var sourceMap []struct{ file string; id int; offset int }
 
     for _, gid := range author.GutenbergIDs {
         path := fmt.Sprintf("%s/raw/%s/%d.txt", corpusDir, author.ID, gid)
@@ -1197,44 +1209,39 @@ func ProcessAuthor(author config.Author, corpusDir string) ([]corpus.Passage, er
         }
         text := string(data)
         chunks := SplitParagraphs(text)
-        offset := 0
         for _, chunk := range chunks {
             score, discard := ScorePassage(chunk)
+            // Find the chunk's byte offset in the source file using strings.Index.
+            // This is accurate for distinct chunks; for exact duplicates the first
+            // occurrence is recorded, which is acceptable for corpus provenance.
+            charOffset := strings.Index(text, chunk)
+            if charOffset < 0 {
+                charOffset = 0
+            }
             allChunks = append(allChunks, ScoredChunk{
-                Text:       chunk,
-                Score:      score,
-                Discard:    discard,
-                CharOffset: offset,
+                Text:        chunk,
+                Score:       score,
+                Discard:     discard,
+                CharOffset:  charOffset,
+                SourceFile:  path,
+                GutenbergID: gid,
             })
-            sourceMap = append(sourceMap, struct{ file string; id int; offset int }{
-                file:   path,
-                id:     gid,
-                offset: offset,
-            })
-            offset += len(chunk)
         }
     }
 
     selected := SelectTop(allChunks, author.TargetPassages)
     passages := make([]corpus.Passage, 0, len(selected))
     for i, chunk := range selected {
-        // Find the source info for this chunk by matching text
-        src := struct{ file string; id int; offset int }{}
-        for j, c := range allChunks {
-            if c.Text == chunk.Text {
-                src = sourceMap[j]
-                break
-            }
-        }
+        // Source provenance is carried directly on the chunk — no text search needed.
         passages = append(passages, corpus.Passage{
             ID:          fmt.Sprintf("%s-%04d", author.ID, i+1),
             AuthorID:    author.ID,
             AuthorName:  author.Name,
             Text:        chunk.Text,
             Score:       chunk.Score,
-            SourceFile:  src.file,
-            GutenbergID: src.id,
-            CharOffset:  src.offset,
+            SourceFile:  chunk.SourceFile,
+            GutenbergID: chunk.GutenbergID,
+            CharOffset:  chunk.CharOffset,
         })
     }
     return passages, nil
@@ -1504,6 +1511,7 @@ import (
     "context"
     "fmt"
     "os"
+    "strings"
 
     "github.com/spf13/cobra"
 
@@ -1545,15 +1553,20 @@ func runFetch(cmd *cobra.Command, args []string) error {
     ctx := context.Background()
     client := pipeline.NewGutendexClient()
 
+    var failed []string
     for _, author := range authors {
         for _, gid := range author.GutenbergIDs {
             fmt.Fprintf(os.Stderr, "Fetching %s / book %d...\n", author.ID, gid)
             if err := pipeline.FetchAndSave(ctx, client, author.ID, gid, "corpus", fetchForce); err != nil {
                 fmt.Fprintf(os.Stderr, "  ERROR: %v\n", err)
+                failed = append(failed, fmt.Sprintf("%s/%d: %v", author.ID, gid, err))
                 continue
             }
             fmt.Fprintf(os.Stderr, "  OK\n")
         }
+    }
+    if len(failed) > 0 {
+        return fmt.Errorf("fetch failed for %d book(s):\n%s", len(failed), strings.Join(failed, "\n"))
     }
     return nil
 }
@@ -1755,6 +1768,7 @@ package ingest
 
 import (
     "context"
+    "errors"
     "fmt"
     "os"
 
@@ -1790,16 +1804,18 @@ func runEmbed(cmd *cobra.Command, args []string) error {
         passages = filterPassages(passages, embedAuthorID)
     }
 
-    alreadyEmbedded, err := corpus.ReadEmbeddedIDs("corpus/embedded.json")
-    if err != nil {
-        return fmt.Errorf("read embedded IDs: %w", err)
-    }
-
+    // Read embedded.json once; derive the already-embedded ID set from it
+    // rather than calling ReadEmbeddedIDs (which would open the file twice).
     existing, err := corpus.ReadEmbedded("corpus/embedded.json")
-    if os.IsNotExist(err) {
+    if errors.Is(err, os.ErrNotExist) {
         existing = nil
     } else if err != nil {
         return fmt.Errorf("read embedded: %w", err)
+    }
+
+    alreadyEmbedded := make(map[string]bool, len(existing))
+    for _, ep := range existing {
+        alreadyEmbedded[ep.ID] = true
     }
 
     client, err := bedrock.New(ctx)
@@ -1949,39 +1965,105 @@ Expected: `--- SKIP: TestChromaStore (CHROMA_URL not set — skipping ChromaStor
 
 - [ ] **Step 3: Create `internal/store/chroma.go`**
 
+ChromaDB is accessed over its HTTP REST API (no Go client library — the chroma-go library has an unstable API that diverges from the server). All communication goes through `net/http` which is in the stdlib.
+
+ChromaDB REST endpoints used:
+- `GET /api/v1/collections/{name}` — fetch collection by name
+- `POST /api/v1/collections` — create collection
+- `POST /api/v1/collections/{id}/upsert` — upsert documents with embeddings
+- `POST /api/v1/collections/{id}/delete` — delete by `where` filter
+- `POST /api/v1/collections/{id}/query` — ANN search
+
 ```go
 package store
 
 import (
+    "bytes"
     "context"
+    "encoding/json"
     "fmt"
-
-    chroma "github.com/amikos-tech/chroma-go"
-    "github.com/amikos-tech/chroma-go/types"
+    "io"
+    "net/http"
 
     "literary-dna/internal/corpus"
 )
 
-// ChromaStore implements Store using a ChromaDB collection.
+// ChromaStore implements Store using the ChromaDB HTTP REST API.
 type ChromaStore struct {
-    client     *chroma.Client
-    collection *chroma.Collection
+    base         string       // e.g. "http://localhost:8000"
+    collectionID string       // UUID assigned by ChromaDB
+    http         *http.Client
 }
 
-// NewChromaStore connects to ChromaDB at url and gets or creates a collection
-// with the given name.
-func NewChromaStore(ctx context.Context, url, collectionName string) (*ChromaStore, error) {
-    client, err := chroma.NewClient(chroma.WithBasePath(url))
+type chromaCollection struct {
+    ID   string `json:"id"`
+    Name string `json:"name"`
+}
+
+// NewChromaStore connects to ChromaDB at baseURL and gets or creates a
+// collection with cosine distance space.
+func NewChromaStore(ctx context.Context, baseURL, collectionName string) (*ChromaStore, error) {
+    s := &ChromaStore{base: baseURL, http: &http.Client{}}
+
+    col, err := s.getOrCreateCollection(ctx, collectionName)
     if err != nil {
-        return nil, fmt.Errorf("chroma client: %w", err)
+        return nil, err
+    }
+    s.collectionID = col.ID
+    return s, nil
+}
+
+// doJSON sends a JSON request and decodes the response into out (if non-nil).
+func (s *ChromaStore) doJSON(ctx context.Context, method, path string, body interface{}, out interface{}) error {
+    var bodyReader io.Reader
+    if body != nil {
+        data, err := json.Marshal(body)
+        if err != nil {
+            return err
+        }
+        bodyReader = bytes.NewReader(data)
     }
 
-    col, err := client.GetOrCreateCollection(ctx, collectionName, map[string]interface{}{}, nil, types.L2)
+    req, err := http.NewRequestWithContext(ctx, method, s.base+path, bodyReader)
     if err != nil {
-        return nil, fmt.Errorf("get/create collection %q: %w", collectionName, err)
+        return err
+    }
+    if body != nil {
+        req.Header.Set("Content-Type", "application/json")
     }
 
-    return &ChromaStore{client: client, collection: col}, nil
+    resp, err := s.http.Do(req)
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+    respBody, _ := io.ReadAll(resp.Body)
+
+    if resp.StatusCode >= 300 {
+        return fmt.Errorf("chroma %s %s: HTTP %d: %s", method, path, resp.StatusCode, respBody)
+    }
+    if out != nil {
+        return json.Unmarshal(respBody, out)
+    }
+    return nil
+}
+
+func (s *ChromaStore) getOrCreateCollection(ctx context.Context, name string) (*chromaCollection, error) {
+    // Try to GET the existing collection first
+    var col chromaCollection
+    if err := s.doJSON(ctx, "GET", "/api/v1/collections/"+name, nil, &col); err == nil {
+        return &col, nil
+    }
+
+    // Create it if it didn't exist
+    payload := map[string]interface{}{
+        "name":     name,
+        "metadata": map[string]interface{}{"hnsw:space": "cosine"},
+    }
+    if err := s.doJSON(ctx, "POST", "/api/v1/collections", payload, &col); err != nil {
+        return nil, fmt.Errorf("create collection %q: %w", name, err)
+    }
+    return &col, nil
 }
 
 func (s *ChromaStore) Upsert(ctx context.Context, passages []corpus.EmbeddedPassage) error {
@@ -2004,44 +2086,56 @@ func (s *ChromaStore) Upsert(ctx context.Context, passages []corpus.EmbeddedPass
         }
     }
 
-    _, err := s.collection.Upsert(ctx, embeddings, metadatas, documents, ids)
-    return err
+    return s.doJSON(ctx, "POST", "/api/v1/collections/"+s.collectionID+"/upsert", map[string]interface{}{
+        "ids":        ids,
+        "embeddings": embeddings,
+        "documents":  documents,
+        "metadatas":  metadatas,
+    }, nil)
 }
 
 func (s *ChromaStore) DeleteByAuthor(ctx context.Context, authorID string) error {
-    _, err := s.collection.Delete(ctx, nil, map[interface{}]interface{}{
-        "author_id": map[string]interface{}{"$eq": authorID},
+    return s.doJSON(ctx, "POST", "/api/v1/collections/"+s.collectionID+"/delete", map[string]interface{}{
+        "where": map[string]interface{}{
+            "author_id": map[string]interface{}{"$eq": authorID},
+        },
     }, nil)
-    return err
+}
+
+type chromaQueryResult struct {
+    IDs       [][]string                 `json:"ids"`
+    Documents [][]string                 `json:"documents"`
+    Metadatas [][]map[string]interface{} `json:"metadatas"`
+    Distances [][]float32                `json:"distances"`
 }
 
 func (s *ChromaStore) Search(ctx context.Context, vec []float32, topK int) ([]corpus.Match, error) {
-    results, err := s.collection.QueryWithOptions(ctx,
-        types.WithQueryVectors([][]float32{vec}),
-        types.WithNResults(int32(topK)),
-        types.WithInclude(types.IDocuments, types.IMetadatas, types.IDistances),
-    )
-    if err != nil {
+    var result chromaQueryResult
+    if err := s.doJSON(ctx, "POST", "/api/v1/collections/"+s.collectionID+"/query", map[string]interface{}{
+        "query_embeddings": [][]float32{vec},
+        "n_results":        topK,
+        "include":          []string{"documents", "metadatas", "distances"},
+    }, &result); err != nil {
         return nil, fmt.Errorf("chroma query: %w", err)
     }
 
-    if len(results.Documents) == 0 || len(results.Documents[0]) == 0 {
+    if len(result.IDs) == 0 || len(result.IDs[0]) == 0 {
         return nil, nil
     }
 
-    docs := results.Documents[0]
-    metas := results.Metadatas[0]
-    dists := results.Distances[0]
-    ids := results.Ids[0]
+    ids := result.IDs[0]
+    docs := result.Documents[0]
+    metas := result.Metadatas[0]
+    dists := result.Distances[0]
 
-    matches := make([]corpus.Match, len(docs))
-    for i, doc := range docs {
+    matches := make([]corpus.Match, len(ids))
+    for i := range ids {
         matches[i] = corpus.Match{
             PassageID:  ids[i],
             AuthorID:   fmt.Sprint(metas[i]["author_id"]),
             AuthorName: fmt.Sprint(metas[i]["author_name"]),
-            Text:       doc,
-            Score:      1 - dists[i], // L2 distance → similarity
+            Text:       docs[i],
+            Score:      float64(1 - dists[i]), // cosine distance → similarity
         }
     }
     return matches, nil
@@ -2189,6 +2283,9 @@ func NewPgvectorStore(ctx context.Context, dsn string) (*PgvectorStore, error) {
 }
 
 func migrate(ctx context.Context, pool *pgxpool.Pool) error {
+    // HNSW is used instead of IVFFlat: IVFFlat requires rows in the table to
+    // build lists, so creating it on an empty table fails. HNSW builds
+    // incrementally and works on empty tables.
     _, err := pool.Exec(ctx, `
         CREATE EXTENSION IF NOT EXISTS vector;
         CREATE TABLE IF NOT EXISTS passages (
@@ -2199,15 +2296,23 @@ func migrate(ctx context.Context, pool *pgxpool.Pool) error {
             embedding   vector(1024) NOT NULL
         );
         CREATE INDEX IF NOT EXISTS passages_embedding_idx
-            ON passages USING ivfflat (embedding vector_cosine_ops)
-            WITH (lists = 100);
+            ON passages USING hnsw (embedding vector_cosine_ops);
     `)
     return err
 }
 
 func (s *PgvectorStore) Upsert(ctx context.Context, passages []corpus.EmbeddedPassage) error {
+    if len(passages) == 0 {
+        return nil
+    }
+    tx, err := s.pool.Begin(ctx)
+    if err != nil {
+        return fmt.Errorf("begin transaction: %w", err)
+    }
+    defer tx.Rollback(ctx) // no-op if committed
+
     for _, p := range passages {
-        _, err := s.pool.Exec(ctx, `
+        _, err := tx.Exec(ctx, `
             INSERT INTO passages (id, author_id, author_name, text, embedding)
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (id) DO UPDATE
@@ -2220,7 +2325,7 @@ func (s *PgvectorStore) Upsert(ctx context.Context, passages []corpus.EmbeddedPa
             return fmt.Errorf("upsert %s: %w", p.ID, err)
         }
     }
-    return nil
+    return tx.Commit(ctx)
 }
 
 func (s *PgvectorStore) DeleteByAuthor(ctx context.Context, authorID string) error {
