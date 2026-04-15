@@ -14,9 +14,19 @@ A single-page frontend for Literary DNA. The user pastes a writing sample, click
 
 ## Technology
 
-- **Preact** + **htm** loaded from CDN via `<script type="module">` — React-compatible component model, ~3KB, no build step
+- **Preact** + **htm** loaded from `esm.sh` CDN via `<script type="module">` — React-compatible component model, ~3KB, no build step
 - **Plain CSS** — minimal reset + CSS custom properties, no framework
 - **Native browser APIs** — `fetch` + `ReadableStream` for SSE, `navigator.clipboard` for copy
+
+### CDN URLs (pinned)
+
+```
+https://esm.sh/preact@10.25.4
+https://esm.sh/preact@10.25.4/hooks
+https://esm.sh/htm@3.1.1
+```
+
+htm must be linked to the same Preact version it was built against. Use `esm.sh` (not unpkg) — it serves ES module format and handles the Preact/htm wiring automatically. Update these together when upgrading.
 
 ---
 
@@ -48,6 +58,8 @@ error   ──[Clear]──► idle
 ### idle
 
 Input card with textarea and Analyze button. Word count displayed below textarea. Analyze is disabled if input is under 20 or over 5,000 words.
+
+**Word count:** `text.trim() === '' ? 0 : text.trim().split(/\s+/).length`. This matches the backend's whitespace-delimited word count exactly. The empty-string case must be handled explicitly — `''.split(/\s+/)` returns `['']` (length 1), which would incorrectly enable Analyze on empty input.
 
 ### loading
 
@@ -83,19 +95,19 @@ Animated placeholder card shown during `loading`. Staggered opacity (1.0 / 0.7 /
 
 Props: `rank`, `authorName`, `score`, `passages`
 
-Renders rank badge, author name, match percentage, and up to 2 evidence passages as blockquotes. Rank badge color: #7c9ef8 (1st), #a78bfa (2nd), #34d399 (3rd).
+Renders rank badge, author name, match percentage, and up to 2 evidence passages as blockquotes. Rank badge color: #7c9ef8 (1st), #a78bfa (2nd), #34d399 (3rd). The results layout renders however many cards the backend returns (1, 2, or 3) — not always 3. Rank colors are assigned by position in the returned array regardless of count.
 
 ### `ExplanationPanel`
 
 Props: `text`, `streaming`
 
-Renders the "Why you match" section. While `streaming` is true, shows a blinking cursor after the text. Once `streaming` is false (after `event: done`), cursor disappears.
+Renders the "Why you match" section. While `streaming` is true, shows a blinking cursor after the text. Once `streaming` is false (after `event: done`), cursor disappears. If `text` is empty and `streaming` is false (Claude returned no content), the panel is hidden entirely rather than showing an empty section.
 
 ### `CopyButton`
 
 Props: `matches`, `explanation` (nullable — omitted from summary if Claude failed)
 
-Copies the structured summary to clipboard. Label toggles to "Copied!" for 2 seconds after click.
+Copies the structured summary to clipboard via `navigator.clipboard.writeText()`. Label toggles to "Copied!" for 2 seconds only on success. On clipboard permission rejection or any other error, the button returns to its default label silently (no error UI needed for this case).
 
 ---
 
@@ -104,11 +116,12 @@ Copies the structured summary to clipboard. Label toggles to "Copied!" for 2 sec
 `EventSource` only supports GET requests. Since `/analyze` is a POST with a JSON body, the stream is consumed via `fetch` + `response.body.getReader()` and parsed manually.
 
 ```js
-async function analyze(text, onMatches, onDelta, onDone, onError) {
+async function analyze(text, signal, onMatches, onDelta, onDone, onError) {
   const res = await fetch('/analyze', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text }),
+    signal, // AbortController signal — allows Clear to cancel in-flight requests
   });
 
   if (!res.ok) {
@@ -120,17 +133,14 @@ async function analyze(text, onMatches, onDelta, onDone, onError) {
   const decoder = new TextDecoder();
   let buffer = '';
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    // parse SSE frames from buffer
+  function processFrames() {
     const frames = buffer.split('\n\n');
     buffer = frames.pop(); // incomplete frame stays in buffer
 
     for (const frame of frames) {
       const eventMatch = frame.match(/^event: (\w+)/m);
+      // Note: matches only the first `data:` line — the backend commits to
+      // single-line JSON payloads, so multi-line data fields are not supported.
       const dataMatch = frame.match(/^data: (.+)/m);
       if (!eventMatch || !dataMatch) continue;
 
@@ -143,8 +153,23 @@ async function analyze(text, onMatches, onDelta, onDone, onError) {
       else if (event === 'error') onError(data);
     }
   }
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    processFrames();
+  }
+
+  // Flush any remaining buffer content after the stream closes.
+  // The server may send the final `event: done` frame in the same TCP segment
+  // as the FIN, causing reader.read() to return done:true before the frame
+  // is processed.
+  if (buffer.trim()) processFrames();
 }
 ```
+
+**Stream cancellation:** `App` creates an `AbortController` when Analyze is clicked and passes `controller.signal` to `analyze`. When Clear is clicked, `controller.abort()` is called, which cancels the fetch and terminates the reader. All `on*` callbacks must be no-ops after abort (the component's state update guards handle this since Preact ignores state updates on unmounted components, and clearing sets `status` to `idle` which stops rendering results).
 
 ---
 
@@ -167,7 +192,7 @@ Joseph Conrad (63%)
 — analyzed by Literary DNA
 ```
 
-Copied via `navigator.clipboard.writeText()`. One evidence passage per author (the first of the two stored). Explanation included if fully streamed; omitted if Claude failed.
+Copied via `navigator.clipboard.writeText()`. One evidence passage per author (the first of the two displayed) — the copy output intentionally shows less than the full on-screen detail to keep the shareable text concise. Explanation included if fully streamed; omitted if Claude failed or if `explanation` is empty.
 
 ---
 
@@ -200,10 +225,13 @@ The Go server registers a handler for `GET /` and all unmatched routes that serv
 No automated tests for the frontend in v1. The SSE parsing function (`analyze`) is a pure function that can be unit tested in isolation if needed, but this is left to implementation discretion. Manual testing covers:
 
 - Idle → submit → skeleton → results → copy
-- Clear from results resets to idle
-- Short input (<20 words) disables Analyze
+- Clear from results resets to idle and cancels in-flight stream
+- Short input (<20 words) disables Analyze; empty input shows 0 words
+- Over-limit input (>5,000 words) disables Analyze
 - Network error before matches shows error state
 - Claude error after matches shows match cards + explanation error
+- Copy button shows "Copied!" only on clipboard success; silent failure otherwise
+- 1 or 2 match results render correctly (not always 3 cards)
 
 ---
 
